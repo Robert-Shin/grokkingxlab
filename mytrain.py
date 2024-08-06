@@ -13,6 +13,7 @@ from model import GPT, GPTConfig
 from dataclasses import dataclass
 # %%
 p = 113
+seed_offset = 0
 model_args = dict(block_size=3, vocab_size=p+1, n_layer=1, n_head=4, n_embd=128, dropout=0.0, bias=False)
 """
 @dataclass
@@ -29,8 +30,8 @@ gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
 
 # %%
-seed_offset = 0
 torch.manual_seed(1337 + seed_offset)
+torch.cuda.manual_seed(1337 + seed_offset)
 r = 0.3
 def fn(a, b):
     return (a + b) % p
@@ -49,7 +50,7 @@ val_labels = labels[split:]
 
 # %%
 #more config
-out_dir = 'out'
+out_dir = 'my_runs'
 eval_interval = 100
 log_interval = 100
 #eval_iters = 200
@@ -57,17 +58,18 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'grokking'
-wandb_run_name = '+p=113seed0' # 'run' + str(time.time())
+wandb_run_name = '+p=113seed0-lr=0.0002' # 'run' + str(time.time())
+title = "113_0_2e-4.pt"
 # data
 #dataset = 'openwebtext'
 batch_size = split # if gradient_accumulation_steps > 1, this is the micro-batch size
 gradient_accumulation_steps = math.ceil(p*p*r/batch_size) # used to simulate larger batch sizes
 block_size = 3
 # adamw optimizer
-learning_rate = 0.001
-max_iters = 10000 # total number of training iterations
+learning_rate = 0.0002
+max_iters = 40000 # total number of training iterations
 weight_decay = 1
 beta1 = 0.9
 beta2 = 0.98
@@ -237,7 +239,7 @@ while True:
                     'run_data': run_data,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(out_dir, title))
     if iter_num == 0 and eval_only:
         break
 
