@@ -8,7 +8,6 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT
 import plotly.express as px
 import plotly.graph_objects as go
 from typing import List, Tuple, Union, Optional
@@ -17,6 +16,7 @@ import einops
 from tqdm import tqdm
 from transformer_lens import HookedTransformer, HookedTransformerConfig, utils
 from my_utils import *
+from model import GPTConfig, GPT
 
 device = t.device("cuda" if t.cuda.is_available() else "cpu")
 # %%
@@ -36,18 +36,17 @@ cfg = HookedTransformerConfig(
 
 hooked_model = HookedTransformer(cfg)
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
+out_dir = 'my_runs' # ignored if init_from is not 'resume'
+title = "113_0_2e-4.pt"
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 1 # number of tokens generated in each sample
-temperature = 0.5 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-seed = 1337
+seed_offset = 0
+seed = 1337 + seed_offset
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 #exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
-
+# %%
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -59,7 +58,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, title)
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
@@ -76,11 +75,10 @@ if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 # %%
 keys = state_dict.keys()
-for key in keys:
-    print(key, (state_dict[key].shape))
+for k,v in state_dict.items():
+    print(k, v.shape)
 
 # %%
-hooked_model = load_in_state_dict(hooked_model, state_dict)
 full_run_data = checkpoint['run_data']
 train_loss = full_run_data['train_loss']
 val_loss = full_run_data['val_loss']
@@ -105,21 +103,9 @@ fig.update_layout(
 
 # Show the plot
 fig.show()
-"""
-lines(
-    lines_list=[
-        full_run_data['train_loss'][::10], 
-        full_run_data['val_loss']
-    ], 
-    labels=['train loss', 'test loss'], 
-    title='Grokking Training Curve', 
-    x=np.arange(5000)*10,
-    xaxis='Epoch',
-    yaxis='Loss',
-    log_y=True
-)
-"""
+
 # %%
+hooked_model = modified_load_in_state_dict(hooked_model, state_dict)
 W_O = hooked_model.W_O[0]
 W_K = hooked_model.W_K[0]
 W_Q = hooked_model.W_Q[0]
@@ -190,6 +176,23 @@ inputs_heatmap(
     animation_name='Neuron'
 )
 # %%
+top_k = 3
+animate_multi_lines(
+    W_neur[..., :top_k],
+    y_index = [f'head {hi}' for hi in range(4)],
+    labels = {'x':'Input token', 'value':'Contribution to neuron'},
+    snapshot='Neuron',
+    title=f'Contribution to first {top_k} neurons via OV-circuit of heads (not weighted by attention)'
+)
+# %%
+lines(
+    W_attn,
+    labels = [f'head {hi}' for hi in range(4)],
+    xaxis='Input token',
+    yaxis='Contribution to attn score',
+    title=f'Contribution to attention score (pre-softmax) for each head'
+)
+# %%
 attn_mat_fourier_basis = fft2d(attn_mat_sq)
 
 # Plot results
@@ -227,3 +230,55 @@ line(
     yaxis='Norm'
 )
 # %%
+def fft1d_given_dim(tensor: t.Tensor, dim: int) -> t.Tensor:
+    '''
+    Performs 1D FFT along the given dimension (not necessarily the last one).
+    '''
+    return fft1d(tensor.transpose(dim, -1)).transpose(dim, -1)
+W_neur_fourier = fft1d_given_dim(W_neur, dim=1)
+
+top_k = 5
+animate_multi_lines(
+    W_neur_fourier[..., :top_k],
+    y_index = [f'head {hi}' for hi in range(4)],
+    labels = {'x':'Fourier component', 'value':'Contribution to neuron'},
+    snapshot='Neuron',
+    hover=fourier_basis_names,
+    title=f'Contribution to first {top_k} neurons via OV-circuit of heads (not weighted by attn), in Fourier basis'
+)
+
+# %%
+neuron_acts_centered = neuron_acts_post_sq - neuron_acts_post_sq.mean((0, 1), keepdim=True)
+
+# Take 2D Fourier transform
+neuron_acts_centered_fourier = fft2d(neuron_acts_centered)
+
+
+imshow_fourier(
+    neuron_acts_centered_fourier.pow(2).mean(-1),
+    title=f"Norms of 2D Fourier components of centered neuron activations",
+)
+# %%
+neuron_freqs, neuron_frac_explained = find_neuron_freqs(neuron_acts_centered_fourier)
+key_freqs, neuron_freq_counts = t.unique(neuron_freqs, return_counts=True)
+
+print(key_freqs.tolist())
+# %%
+fraction_of_activations_positive_at_posn2 = (cache['pre', 0][:, -1] > 0).float().mean(0)
+
+scatter(
+    x=neuron_freqs,
+    y=neuron_frac_explained,
+    xaxis="Neuron frequency",
+    yaxis="Frac explained",
+    colorbar_title="Frac positive",
+    title="Fraction of neuron activations explained by key freq",
+    color=utils.to_numpy(fraction_of_activations_positive_at_posn2)
+)
+# %%
+# To represent that they are in a special sixth cluster, we set the frequency of these neurons to -1
+neuron_freqs[neuron_frac_explained < 0.85] = -1.
+key_freqs_plus = t.concatenate([key_freqs, -key_freqs.new_ones((1,))])
+
+for i, k in enumerate(key_freqs_plus):
+    print(f'Cluster {i}: freq k={k}, {(neuron_freqs==k).sum()} neurons')
