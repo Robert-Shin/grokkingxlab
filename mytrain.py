@@ -14,7 +14,7 @@ from dataclasses import dataclass
 # %%
 p = 113
 seed_offset = 0
-model_args = dict(block_size=3, vocab_size=p+1, n_layer=1, n_head=4, n_embd=128, dropout=0.0, bias=False)
+model_args = dict(block_size=3, vocab_size=p+2, n_layer=1, n_head=4, n_embd=128, dropout=0.0, bias=False)
 """
 @dataclass
 class Config:
@@ -32,17 +32,23 @@ model = GPT(gptconf)
 # %%
 torch.manual_seed(1337 + seed_offset)
 torch.cuda.manual_seed(1337 + seed_offset)
-r = 0.3
+r = 0.2
 def fn(a, b):
     return (a + b) % p
-all_data = torch.tensor([(i, j, p) for i in range(p) for j in range(p)])
-labels = torch.tensor([fn(i, j) for i, j, _ in all_data])
+def subfn(a, b):
+    return (a - b) % p
+add_data = torch.tensor([(i, j, p) for i in range(p) for j in range(p)])
+sub_data = torch.tensor([(i, j, p+1) for i in range(p) for j in range(p)])
+add_labels = torch.tensor([fn(i, j) for i, j, _ in add_data])
+sub_labels = torch.tensor([subfn(i, j) for i, j, _ in sub_data])
 
+all_data = torch.cat((add_data, sub_data))
+labels = torch.cat((add_labels, sub_labels))
 
 indices = torch.randperm(all_data.size()[0])
 all_data = all_data[indices]
 labels = labels[indices]
-split = math.ceil(p*p*r) 
+split = math.ceil(len(all_data)*r) 
 train_data=all_data[0:split]
 train_labels=labels[0:split]
 val_data = all_data[split:]
@@ -60,16 +66,16 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
 wandb_project = 'grokking'
-wandb_run_name = '+p=113seed0-lr=0.0002' # 'run' + str(time.time())
-title = "113_0_2e-4.pt"
+wandb_run_name = '+-p=113seed0-lr=0.0002r=0.2' # 'run' + str(time.time())
+title = "+-113_0_2e-4r=0.2.pt"
 # data
 #dataset = 'openwebtext'
 batch_size = split # if gradient_accumulation_steps > 1, this is the micro-batch size
-gradient_accumulation_steps = math.ceil(p*p*r/batch_size) # used to simulate larger batch sizes
+gradient_accumulation_steps = math.ceil(len(all_data)*r/batch_size) # used to simulate larger batch sizes
 block_size = 3
 # adamw optimizer
 learning_rate = 0.0002
-max_iters = 40000 # total number of training iterations
+max_iters = 100000 # total number of training iterations
 weight_decay = 1
 beta1 = 0.9
 beta2 = 0.98
@@ -162,6 +168,29 @@ def get_loss():
     out['val_accuracy'] = accuracies.mean()
     model.train()
     return out
+@torch.no_grad()
+def get_loss_both():
+    out = {}
+    model.eval()
+    #add loss
+    X, Y = add_data, add_labels
+    X, Y = X.pin_memory().to(device, non_blocking=True), Y.pin_memory().to(device, non_blocking=True)
+    with ctx:
+        logits, loss, accuracy = model(X, Y)
+    loss = loss.item()
+    out['add'] = loss
+    out['add_acc'] = accuracy
+    X, Y = sub_data, sub_labels
+    X, Y = X.pin_memory().to(device, non_blocking=True), Y.pin_memory().to(device, non_blocking=True)
+    with ctx:
+        logits, loss, accuracy = model(X, Y)
+    loss = loss.item()
+    out['sub'] = loss
+    out['sub_acc'] = accuracy
+    return out
+
+
+
 # %%
 def get_batch(split, batch_idx):
     if batch_idx == gradient_accumulation_steps-1:
@@ -199,6 +228,7 @@ run_data = {
     'val_loss': [],
     'train_accuracy': [],
     'val_accuracy': [],
+    'embedding': [],
 }
 while True:
     batch_index = 0
@@ -211,7 +241,9 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = get_loss()
+        split_losses = get_loss_both()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train accuracy {losses['train_accuracy']:.4f}, val accuracy {losses['val_accuracy']:.4f}")
+        print(f"add loss {split_losses['add']:.4f}, add acc {split_losses['add_acc']:.4f}, sub loss {split_losses['sub']:.4f}, sub acc {split_losses['sub_acc']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -219,6 +251,10 @@ while True:
                 "val/loss": losses['val'],
                 "train/accuracy": losses['train_accuracy'],
                 "val/accuracy": losses["val_accuracy"],
+                "total_losses/add": split_losses['add'],
+                "total_losses/sub": split_losses['sub'],
+                "total_accs/add": split_losses['add_acc'],
+                "total_accs/sub": split_losses['sub_acc'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
@@ -228,6 +264,7 @@ while True:
             run_data["val_loss"].append(losses['val'].item())
             run_data["train_accuracy"].append(losses['train_accuracy'].item())
             run_data["val_accuracy"].append(losses['val_accuracy'].item())
+            run_data["embedding"].append(model.transformer.wte)
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
