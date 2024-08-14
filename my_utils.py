@@ -1,4 +1,3 @@
-
 import torch as t
 from torch import Tensor
 import einops
@@ -439,6 +438,11 @@ def arrange_by_2d_freqs(tensor):
 # `einops` is helpful, this has the advantage of making your code more explicit,
 # readable, and reduces the chance of mistakes.
 
+def fft1d_given_dim(tensor: t.Tensor, dim: int) -> t.Tensor:
+    '''
+    Performs 1D FFT along the given dimension (not necessarily the last one).
+    '''
+    return fft1d(tensor.transpose(dim, -1)).transpose(dim, -1)
 
 def find_neuron_freqs(
     fourier_neuron_acts):
@@ -559,8 +563,6 @@ def modified_load_in_state_dict(model, state_dict):
     Loads in state dict, modified for nanogpt
     """
     state_dict_new = model.state_dict()
-    for k, v in state_dict_new.items():
-        print(k, v.shape)
     for k, v in state_dict.items():
         if 'wte' in k:
             state_dict_new["embed.W_E"] = v
@@ -582,11 +584,21 @@ def modified_load_in_state_dict(model, state_dict):
             state_dict_new["blocks.0.attn.W_Q"] = Q
             state_dict_new["blocks.0.attn.W_K"] = K
             state_dict_new["blocks.0.attn.W_V"] = V
+        """
+        elif "ln_f" in k:
+            state_dict_new["ln_final.w"] = v
+        elif "ln_1" in k:
+            state_dict_new["blocks.0.ln1.w"] = v
+        elif "ln_2" in k:
+            state_dict_new["blocks.0.ln2.w"] = v
+        """
+        
     # Make sure biases are zero
     for k, v in state_dict_new.items():
-        if "b_" in k and "mlp" not in k:
+        if "b_" in k or ".b" in k:
             state_dict_new[k] = t.zeros_like(v)
     state_dict_new["blocks.0.attn.IGNORE"] = t.full_like(state_dict_new["blocks.0.attn.IGNORE"], -1e10)
+    
     
     model.load_state_dict(state_dict_new)
     return model
