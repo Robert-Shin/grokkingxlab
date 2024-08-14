@@ -84,14 +84,25 @@ class MLP(nn.Module):
         self.relu    = nn.ReLU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.ablation_mask = torch.ones(4 * config.n_embd, device='cuda')
+        self.n_embd = config.n_embd
+        #If device type is not cuda, set accordingly or remove ablation_mask entirely
 
     def forward(self, x):
         x = self.c_fc(x)
         #x = self.gelu(x)
         x = self.relu(x)
+        x = x * self.ablation_mask
         x = self.c_proj(x)
-        x = self.dropout(x)
+        #x = self.dropout(x)
         return x
+
+    def set_ablation_mask(self, mask):
+        self.ablation_mask = mask
+
+    def reset_ablation_mask(self):
+        self.ablation_mask = torch.ones(4 * self.n_embd, device='cuda')
+
 
 class Block(nn.Module):
 
@@ -133,7 +144,6 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        #ln_f = LayerNorm(config.n_embd, bias=config.bias), within ModuleDict
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
