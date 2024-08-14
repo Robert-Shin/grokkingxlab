@@ -37,7 +37,7 @@ cfg = HookedTransformerConfig(
 hooked_model = HookedTransformer(cfg)
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'my_runs' # ignored if init_from is not 'resume'
-title = "113_0_2e-4.pt"
+title = "+-113_0_2e-4.pt"
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 seed_offset = 0
 seed = 1337 + seed_offset
@@ -73,17 +73,13 @@ model.eval()
 model.to(device)
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
-# %%
-keys = state_dict.keys()
-for k,v in state_dict.items():
-    print(k, v.shape)
 
 # %%
 full_run_data = checkpoint['run_data']
 train_loss = full_run_data['train_loss']
 val_loss = full_run_data['val_loss']
 
-epochs = list(range(0, len(train_loss)*100, 100))
+epochs = list(range(0, len(train_loss)*25, 100))
 
 # Create the plot
 fig = go.Figure()
@@ -106,6 +102,7 @@ fig.show()
 
 # %%
 hooked_model = modified_load_in_state_dict(hooked_model, state_dict)
+
 W_O = hooked_model.W_O[0]
 W_K = hooked_model.W_K[0]
 W_Q = hooked_model.W_Q[0]
@@ -130,13 +127,23 @@ print('W_U  ', tuple(W_U.shape))
 # %%
 def fn(a, b):
     return (a + b) % p
-
+def subfn(a, b):
+    return (a - b) % p
 all_data = t.tensor([(i, j, p) for i in range(p) for j in range(p)]).to(device)
+sub_data = t.tensor([(i, j, 0) for i in range(p) for j in range(p)]).to(device)
 labels = t.tensor([fn(i, j) for i, j, _ in all_data]).to(device)
-original_logits, cache = hooked_model.run_with_cache(all_data)
+sub_labels = t.tensor([subfn(i, j) for i, j, _ in sub_data]).to(device)
+
+#all_data = t.cat((all_data, sub_data)).to(device)
+#labels = t.cat((labels, sub_labels)).to(device)
+
+original_logits, cache = hooked_model.run_with_cache(sub_data)
 # Final position only, also remove the logits for `=`
 original_logits = original_logits[:, -1, :-1]
-original_loss = cross_entropy_high_precision(original_logits, labels)
+original_loss = cross_entropy_high_precision(original_logits, sub_labels)
+with t.no_grad():
+    logits, original_loss, accuracy = model(all_data, labels)
+
 print(f"Original loss: {original_loss.item()}")
 # %%
 attn_mat = cache['pattern', 0][:, :, 2]
@@ -151,7 +158,31 @@ W_neur = W_E @ W_OV @ W_in
 W_QK = W_Q @ W_K.transpose(-1, -2)
 W_attn = final_pos_resid_initial @ W_QK @ W_E.T / (cfg.d_head ** 0.5)
 
+average_attn = attn_mat.mean(dim=0)
+seq_len = 3
+num_heads = 4  # assuming 4 heads
+
+# Initialize a matrix to store the results
+average_attn_matrix = torch.zeros(num_heads, seq_len)
+
+# Populate the average_attn_matrix
+for head in range(num_heads):
+    for pos in range(seq_len):
+        # Average attention score for head at each position
+        average_attn_matrix[head, pos] = average_attn[head, pos]
+scaled = average_attn_matrix * 1000.0
+scaled = t.round(scaled)
+average_attn_matrix = scaled / 1000.0
+inputs_heatmap(
+    average_attn_matrix,
+    title=f'Attention score for heads at each position',
+    xaxis=f'Position',
+    yaxis=f'Head',
+    text_auto=True
+)
+# %%
 attn_mat = attn_mat[:, :, :2]
+
 # Note, we ignore attn from 2 -> 2
 
 attn_mat_sq = einops.rearrange(attn_mat, "(x y) head seq -> x y head seq", x=p)
@@ -176,6 +207,7 @@ inputs_heatmap(
     animation_name='Neuron'
 )
 # %%
+
 top_k = 3
 animate_multi_lines(
     W_neur[..., :top_k],
@@ -184,6 +216,7 @@ animate_multi_lines(
     snapshot='Neuron',
     title=f'Contribution to first {top_k} neurons via OV-circuit of heads (not weighted by attention)'
 )
+
 # %%
 lines(
     W_attn,
@@ -230,11 +263,6 @@ line(
     yaxis='Norm'
 )
 # %%
-def fft1d_given_dim(tensor: t.Tensor, dim: int) -> t.Tensor:
-    '''
-    Performs 1D FFT along the given dimension (not necessarily the last one).
-    '''
-    return fft1d(tensor.transpose(dim, -1)).transpose(dim, -1)
 W_neur_fourier = fft1d_given_dim(W_neur, dim=1)
 
 top_k = 5
@@ -263,6 +291,7 @@ neuron_freqs, neuron_frac_explained = find_neuron_freqs(neuron_acts_centered_fou
 key_freqs, neuron_freq_counts = t.unique(neuron_freqs, return_counts=True)
 
 print(key_freqs.tolist())
+
 # %%
 fraction_of_activations_positive_at_posn2 = (cache['pre', 0][:, -1] > 0).float().mean(0)
 
@@ -282,3 +311,40 @@ key_freqs_plus = t.concatenate([key_freqs, -key_freqs.new_ones((1,))])
 
 for i, k in enumerate(key_freqs_plus):
     print(f'Cluster {i}: freq k={k}, {(neuron_freqs==k).sum()} neurons')
+
+# %%
+mask = torch.zeros(512, device=device, dtype=torch.int)
+for freq in key_freqs:
+    new_mask = (neuron_freqs == freq).int()
+    mask = mask | new_mask
+with t.no_grad():
+    model.transformer.h[0].mlp.set_ablation_mask(mask)
+    logits, ablated_loss, accuracy = model(all_data, labels)
+    model.transformer.h[0].mlp.reset_ablation_mask()
+print('Loss with neuron activations ONLY in key freq\n{:.6e}\n'.format(ablated_loss))
+print('Original loss\n{:.6e}'.format(original_loss))
+
+# %%
+print('Loss with neuron activations excluding none:     {:.9f}'.format(original_loss.item()))
+for c, freq in enumerate(key_freqs):
+    mask = torch.ones(512, device=device, dtype=torch.int)
+    new_mask = (neuron_freqs != freq).int()
+    mask = mask & new_mask
+    with t.no_grad():
+        model.transformer.h[0].mlp.set_ablation_mask(mask)
+        l, ablated_loss, _ = model(all_data, labels)
+        model.transformer.h[0].mlp.reset_ablation_mask()
+    print('Loss with neuron activations excluding freq={}:  {:.9f}'.format(freq, ablated_loss))
+
+# %%
+US = W_logit @ fourier_basis.T
+
+imshow_div(
+    US,
+    x=fourier_basis_names,
+    yaxis='Neuron index',
+    title='W_logit in the Fourier Basis',
+    height=800,
+    width=600
+)
+# %%
