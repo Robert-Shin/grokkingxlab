@@ -1,320 +1,671 @@
-# %%
-import os
-import time
-import math
-import pickle
-from contextlib import nullcontext
-
+import torch as t
+from torch import Tensor
+import einops
+import torch.nn.functional as F
+import plotly.express as px
+import plotly.graph_objects as go
+from functools import partial
 import numpy as np
-import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
-from model import GPT, GPTConfig
-from dataclasses import dataclass
-# %%
+import pandas as pd
+from IPython.display import display
+from typing import Tuple, List, Callable
+from jaxtyping import Float, Int
+from transformer_lens import HookedTransformer, utils
+from transformer_lens.hook_points import HookPoint
+import random
+
+# from IPython import get_ipython
+# ipython = get_ipython()
+# ipython.run_line_magic("load_ext", "autoreload")
+# ipython.run_line_magic("autoreload", "2")
+
+device = t.device("cuda" if t.cuda.is_available() else "cpu")
+
 p = 113
-seed_offset = 0
-model_args = dict(block_size=3, vocab_size=p+2, n_layer=1, n_head=4, n_embd=128, dropout=0.0, bias=False)
-"""
-@dataclass
-class Config:
-    block_size: int = 128 // 4
-    vocab_size: int = p+1 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 1
-    n_head: int = 4
-    n_embd: int = 128
-    dropout: float = 0.0
-    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-"""
-gptconf = GPTConfig(**model_args)
-model = GPT(gptconf)
-
-# %%
-torch.manual_seed(1337 + seed_offset)
-torch.cuda.manual_seed(1337 + seed_offset)
-r = 0.2
-def fn(a, b):
-    return (a + b) % p
-def subfn(a, b):
-    return (a - b) % p
-add_data = torch.tensor([(i, j, p) for i in range(p) for j in range(p)])
-sub_data = torch.tensor([(i, j, p+1) for i in range(p) for j in range(p)])
-add_labels = torch.tensor([fn(i, j) for i, j, _ in add_data])
-sub_labels = torch.tensor([subfn(i, j) for i, j, _ in sub_data])
-
-all_data = torch.cat((add_data, sub_data))
-labels = torch.cat((add_labels, sub_labels))
-
-indices = torch.randperm(all_data.size()[0])
-all_data = all_data[indices]
-labels = labels[indices]
-split = math.ceil(len(all_data)*r) 
-train_data=all_data[0:split]
-train_labels=labels[0:split]
-val_data = all_data[split:]
-val_labels = labels[split:]
-
-# %%
-#more config
-out_dir = 'my_runs'
-eval_interval = 100
-log_interval = 100
-#eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = True # disabled by default
-wandb_project = 'grokking'
-wandb_run_name = '+-p=113seed0-lr=0.0002r=0.2' # 'run' + str(time.time())
-title = "+-113_0_2e-4r=0.2.pt"
-# data
-#dataset = 'openwebtext'
-batch_size = split # if gradient_accumulation_steps > 1, this is the micro-batch size
-gradient_accumulation_steps = math.ceil(len(all_data)*r/batch_size) # used to simulate larger batch sizes
-block_size = 3
-# adamw optimizer
-learning_rate = 0.0002
-max_iters = 100000 # total number of training iterations
-weight_decay = 1
-beta1 = 0.9
-beta2 = 0.98
-grad_clip = 0.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = False # whether to decay the learning rate
-#warmup_iters = 0 # how many steps to warm up for
-#lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-#min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-#backend = 'nccl' # 'nccl', 'gloo', etc.
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-# -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-#exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-master_process = True
-
-ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
-os.makedirs(out_dir, exist_ok=True)
-
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-# %%
-iter_num = 0
-best_val_loss = 1e9
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
-
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model)
+def make_fourier_basis(p: int) -> Tuple[t.Tensor, List[str]]:
+    '''
+    Returns a pair `fourier_basis, fourier_basis_names`, where `fourier_basis` is
+    a `(p, p)` tensor whose rows are Fourier components and `fourier_basis_names`
+    is a list of length `p` containing the names of the Fourier components (e.g. 
+    `["const", "cos 1", "sin 1", ...]`). You may assume that `p` is odd.
+    '''
+    # Define a grid for the Fourier basis vecs (we'll normalize them all at the end)
+    # Note, the first vector is just the constant wave
+    fourier_basis = t.ones(p, p)
+    fourier_basis_names = ['Const']
+    for i in range(1, p // 2 + 1):
+        # Define each of the cos and sin terms
+        fourier_basis[2*i-1] = t.cos(2*t.pi*t.arange(p)*i/p)
+        fourier_basis[2*i] = t.sin(2*t.pi*t.arange(p)*i/p)
+        fourier_basis_names.extend([f'cos {i}', f'sin {i}'])
+    # Normalize vectors, and return them
+    fourier_basis /= fourier_basis.norm(dim=1, keepdim=True)
+    # print(fourier_basis[13][5].item())
+    return fourier_basis.to(device), fourier_basis_names
 
 
-# %%
-@torch.no_grad()
-def get_loss():
-    out = {}
-    model.eval()
-    #train
-    index = 0
-    losses = torch.zeros(gradient_accumulation_steps)
-    accuracies = torch.zeros(gradient_accumulation_steps)
-    for k in range(gradient_accumulation_steps):
-        X, Y = get_batch('train', index)
-        index += 1
-        with ctx:
-            logits, loss, accuracy = model(X, Y)
-        losses[k] = loss.item()
-        accuracies[k] = accuracy
-    out['train'] = losses.mean()
-    out['train_accuracy'] = accuracies.mean()
-    #test
-    index = 0
-    """
-    Removed for full batch test loss
-    test_steps = math.ceil(p*p*(1-r)/batch_size)
-    losses = torch.zeros(test_steps)
-    accuracies = torch.zeros(test_steps)
-    for k in range(test_steps):
-    """
-    losses = torch.zeros(1)
-    accuracies = torch.zeros(1)
-    for k in range(1):
-        X, Y = get_batch('val', index)
-        index += 1
-        with ctx:
-            logits, loss, accuracy = model(X, Y)
-        losses[k] = loss.item()
-        accuracies[k] = accuracy
-    out['val'] = losses.mean()
-    out['val_accuracy'] = accuracies.mean()
-    model.train()
-    return out
-@torch.no_grad()
-def get_loss_both():
-    out = {}
-    model.eval()
-    #add loss
-    X, Y = add_data, add_labels
-    X, Y = X.pin_memory().to(device, non_blocking=True), Y.pin_memory().to(device, non_blocking=True)
-    with ctx:
-        logits, loss, accuracy = model(X, Y)
-    loss = loss.item()
-    out['add'] = loss
-    out['add_acc'] = accuracy
-    X, Y = sub_data, sub_labels
-    X, Y = X.pin_memory().to(device, non_blocking=True), Y.pin_memory().to(device, non_blocking=True)
-    with ctx:
-        logits, loss, accuracy = model(X, Y)
-    loss = loss.item()
-    out['sub'] = loss
-    out['sub_acc'] = accuracy
-    return out
+fourier_basis, fourier_basis_names = make_fourier_basis(p)
+
+is_train = None
+is_test = None
+
+lr=1e-3 
+weight_decay = 1.0 
+p=113 
+d_model = 128 
+fn_name = 'add' # ['add', 'subtract', 'x2xyy2','rand']
+frac_train = 0.3 
+num_epochs = 50000 
+save_models = False 
+save_every = 100 
+# Stop training when test loss is < stopping_thresh
+stopping_thresh = -1 
+seed = 0 
+
+device = t.device('cuda' if t.cuda.is_available() else 'cpu')
+
+num_layers = 1
+batch_style = 'full'
+d_vocab = p+1
+n_ctx = 3
+d_mlp = 4*d_model
+num_heads = 4
+assert d_model % num_heads == 0
+d_head = d_model//num_heads
+act_type = 'ReLU' #@param ['ReLU', 'GeLU']
+# batch_size = 512
+use_ln = False
+random_answers = np.random.randint(low=0, high=p, size=(p, p))
+fns_dict = {'add': lambda x,y:(x+y)%p, 'subtract': lambda x,y:(x-y)%p, 'x2xyy2':lambda x,y:(x**2+x*y+y**2)%p, 'rand':lambda x,y:random_answers[x][y]}
+fn = fns_dict[fn_name]
+
+all_data = t.tensor([(i, j, p) for i in range(p) for j in range(p)]).to(device)
+labels = t.tensor([fn(i, j) for i, j, _ in all_data]).to(device)
+
+def unflatten_first(tensor):
+    if tensor.shape[0]==p*p:
+        return einops.rearrange(tensor, '(x y) ... -> x y ...', x=p, y=p)
+    else: 
+        return tensor
+def cos(x, y):
+    return (x.dot(y))/x.norm()/y.norm()
+def mod_div(a, b):
+    return (a*pow(b, p-2, p))%p
+def normalize(tensor, axis=0):
+    return tensor/(tensor).pow(2).sum(keepdim=True, axis=axis).sqrt()
+def extract_freq_2d(tensor, freq):
+    # Takes in a pxpx... or batch x ... tensor, returns a 3x3x... tensor of the 
+    # Linear and quadratic terms of frequency freq
+    tensor = unflatten_first(tensor)
+    # Extracts the linear and quadratic terms corresponding to frequency freq
+    index_1d = [0, 2*freq-1, 2*freq]
+    # Some dumb manipulation to use fancy array indexing rules
+    # Gets the rows and columns in index_1d
+    return tensor[[[i]*3 for i in index_1d], [index_1d]*3]
+def get_cov(tensor, norm=True):
+    # Calculate covariance matrix
+    if norm:
+        tensor = normalize(tensor, axis=1)
+    return tensor @ tensor.T
+def is_close(a, b):
+    return ((a-b).pow(2).sum()/(a.pow(2).sum().sqrt())/(b.pow(2).sum().sqrt())).item()
+
+# Helper functions
+def cuda_memory():
+    print(t.cuda.memory_allocated()/1e9)
+
+def cross_entropy_high_precision(logits, labels):
+    # Shapes: batch x vocab, batch
+    # Cast logits to float64 because log_softmax has a float32 underflow on overly 
+    # confident data and can only return multiples of 1.2e-7 (the smallest float x
+    # such that 1+x is different from 1 in float32). This leads to loss spikes 
+    # and dodgy gradients
+    logprobs = F.log_softmax(logits.to(t.float64), dim=-1)
+    prediction_logprobs = t.gather(logprobs, index=labels[:, None], dim=-1)
+    loss = -t.mean(prediction_logprobs)
+    return loss
+
+def full_loss(model, data):
+    # Take the final position only
+    logits = model(data)[:, -1]
+    labels = t.tensor([fn(i, j) for i, j, _ in data]).to('cpu')
+    return cross_entropy_high_precision(logits, labels)
+
+def test_logits(logits, bias_correction=False, original_logits=None, mode='all'):
+    # Calculates cross entropy loss of logits representing a batch of all p^2 
+    # possible inputs
+    # Batch dimension is assumed to be first
+    if logits.shape[1]==p*p:
+        logits = logits.T
+    if logits.shape==t.Size([p*p, p+1]):
+        logits = logits[:, :-1]
+    logits = logits.reshape(p*p, p)
+    if bias_correction:
+        # Applies bias correction - we correct for any missing bias terms, 
+        # independent of the input, by centering the new logits along the batch 
+        # dimension, and then adding the average original logits across all inputs
+        original_logits = original_logits.reshape(p*p, p)
+        logits = einops.reduce(original_logits - logits, 'batch ... -> ...', 'mean') + logits
+    if mode=='train':
+        return cross_entropy_high_precision(logits[is_train], labels[is_train])
+    elif mode=='test':
+        return cross_entropy_high_precision(logits[is_test], labels[is_test])
+    elif mode=='all':
+        return cross_entropy_high_precision(logits, labels)
 
 
+#Plotting functions
+# This is mostly a bunch of over-engineered mess to hack Plotly into producing 
+# the pretty pictures I want, I recommend not reading too closely unless you 
+# want Plotly hacking practice
+def imshow(tensor: t.Tensor, xaxis=None, yaxis=None, animation_name='Snapshot', vline_positions=[], vline_labels=[], hline_positions=[], hline_labels=[], animation_labels=[], **kwargs):
+    if tensor.shape[0]==p*p:
+        tensor = unflatten_first(tensor)
+    tensor = t.squeeze(tensor)
+    fig = px.imshow(utils.to_numpy(tensor), labels={'x': xaxis, 'y': yaxis, 'animation_frame': animation_name}, **kwargs)
+    if animation_labels:
+        for i, label in enumerate(animation_labels):
+            fig.layout.sliders[0].steps[i]["label"] = label
+    for x, text in zip(vline_positions, vline_labels):
+        fig.add_vline(x=x-0.5, line_width=1, annotation_text=text, annotation_position="top left")
+    for y, text in zip(hline_positions, hline_labels):
+        fig.add_hline(y=y-0.5, line_width=1, annotation_text=text, annotation_position="top left")
+    y_axis, x_axis = [s for i, s in enumerate(tensor.shape) if i != kwargs.get("animation_frame", None)]
+    fig.update_yaxes(range=[y_axis-0.5, 0-0.5], autorange=False)
+    fig.update_xaxes(range=[0-0.5, x_axis-0.5], autorange=False)
+    fig.show()
+# Set default colour scheme
+imshow = partial(imshow, color_continuous_scale='Blues')
+# Creates good defaults for showing divergent colour scales (ie with both 
+# positive and negative values, where 0 is white)
+imshow_div = partial(imshow, color_continuous_scale='RdBu', color_continuous_midpoint=0.0)
 
-# %%
-def get_batch(split, batch_idx):
-    if batch_idx == gradient_accumulation_steps-1:
-        if split == 'train':
-            x = train_data[batch_idx*batch_size:]
-            y = train_labels[batch_idx*batch_size:]
+# Presets a bunch of defaults to imshow to make it suitable for showing heatmaps 
+# of activations with x axis being input 1 and y axis being input 2.
+inputs_heatmap: Callable = partial(imshow, xaxis='Input 1', yaxis='Input 2', color_continuous_scale='RdBu', color_continuous_midpoint=0.0)
+
+def line(x, y=None, hover=None, xaxis='', yaxis='', **kwargs):
+    if type(y)==t.Tensor:
+        y = utils.to_numpy(y.flatten())
+    if type(x)==t.Tensor:
+        x=utils.to_numpy(x.flatten())
+    fig = px.line(x, y=y, hover_name=hover, **kwargs)
+    fig.update_layout(xaxis_title=xaxis, yaxis_title=yaxis)
+    if x.ndim==1:
+        fig.update_layout(showlegend=False)
+    fig.show()
+
+
+def scatter(x, y, title="", xaxis="", yaxis="", colorbar_title="", **kwargs):
+    fig = px.scatter(x=utils.to_numpy(x.flatten()), y=utils.to_numpy(y.flatten()), title=title, labels={"color": colorbar_title}, **kwargs)
+    fig.update_layout(xaxis_title=xaxis, yaxis_title=yaxis)
+    if "xaxis_range" in kwargs:
+        fig.update_xaxes(range=kwargs["xaxis_range"])
+    if "yaxis_range" in kwargs:
+        fig.update_yaxes(range=kwargs["yaxis_range"])
+    fig.show()
+
+
+def lines(lines_list, x=None, mode='lines', labels=None, xaxis='', yaxis='', title = '', log_y=False, hover=None, **kwargs):
+    # Helper function to plot multiple lines
+    if type(lines_list)==t.Tensor:
+        lines_list = [lines_list[i] for i in range(lines_list.shape[0])]
+    if x is None:
+        x=np.arange(len(lines_list[0]))
+    fig = go.Figure(layout={'title':title})
+    fig.update_xaxes(title=xaxis)
+    fig.update_yaxes(title=yaxis)
+    for c, line in enumerate(lines_list):
+        if type(line)==t.Tensor:
+            line = utils.to_numpy(line)
+        if labels is not None:
+            label = labels[c]
         else:
-            x = val_data[batch_idx*batch_size:]
-            y = val_labels[batch_idx*batch_size:]
+            label = c
+        fig.add_trace(go.Scatter(x=x, y=line, mode=mode, name=label, hovertext=hover, **kwargs))
+    if log_y:
+        fig.update_layout(yaxis_type="log")
+    fig.show()
+
+def line_marker(x, **kwargs):
+    lines([x], mode='lines+markers', **kwargs)
+
+
+def animate_lines(lines_list, snapshot_index = None, snapshot='snapshot', hover=None, xaxis='x', yaxis='y', title='', **kwargs):
+    if type(lines_list)==list:
+        lines_list = t.stack(lines_list, axis=0)
+    lines_list = utils.to_numpy(lines_list)
+    if snapshot_index is None:
+        snapshot_index = np.arange(lines_list.shape[0])
+    if hover is not None:
+        hover = [i for j in range(len(snapshot_index)) for i in hover]
+    rows=[]
+    for i in range(lines_list.shape[0]):
+        for j in range(lines_list.shape[1]):
+            rows.append([lines_list[i][j], snapshot_index[i], j])
+    df = pd.DataFrame(rows, columns=[yaxis, snapshot, xaxis])
+    fig = px.line(df, x=xaxis, y=yaxis, title=title, animation_frame=snapshot, range_y=[lines_list.min(), lines_list.max()], hover_name=hover,**kwargs)
+    fig.update_layout(
+        transition={'duration': 0},
+        xaxis_title=xaxis,
+        yaxis_title=yaxis,
+    )
+    fig.show()
+
+
+def imshow_fourier(tensor, title='', animation_name='snapshot', facet_labels=[], animation_labels=[], **kwargs):
+    # Set nice defaults for plotting functions in the 2D fourier basis
+    # tensor is assumed to already be in the Fourier Basis
+    if tensor.shape[0]==p*p:
+        tensor = unflatten_first(tensor)
+    if tuple(tensor.shape[:2]) == (p, p):
+        tensor = tensor.transpose(0, 1)
+    tensor = t.squeeze(tensor)
+    fig=px.imshow(utils.to_numpy(tensor),
+            x=fourier_basis_names, 
+            y=fourier_basis_names, 
+            labels={'x':'x Component', 
+                    'y':'y Component', 
+                    'animation_frame':animation_name},
+            title=title,
+            color_continuous_midpoint=0., 
+            color_continuous_scale='RdBu', 
+            **kwargs)
+    fig.update(data=[{'hovertemplate':"%{x}x * %{y}y<br>Value:%{z:.4f}"}])
+    if facet_labels:
+        for i, label in enumerate(facet_labels):
+            fig.layout.annotations[i]['text'] = label
+    if animation_labels:
+        for i, label in enumerate(animation_labels):
+            fig.layout.sliders[0].steps[i]["label"] = label
+    fig.show()
+
+
+def animate_multi_lines(lines_list, y_index=None, snapshot_index = None, snapshot='snapshot', hover=None, swap_y_animate=False, **kwargs):
+    # Can plot an animation of lines with multiple lines on the plot.
+    if type(lines_list)==list:
+        lines_list = t.stack(lines_list, axis=0)
+    lines_list = utils.to_numpy(lines_list)
+    lines_list = lines_list.transpose(2, 0, 1)
+    if swap_y_animate:
+        lines_list = lines_list.transpose(1, 0, 2)
+    if snapshot_index is None:
+        snapshot_index = np.arange(lines_list.shape[0])
+    if y_index is None:
+        y_index = [str(i) for i in range(lines_list.shape[1])]
+    if hover is not None:
+        hover = [i for j in range(len(snapshot_index)) for i in hover]
+    # print(lines_list.shape)
+    rows=[]
+    for i in range(lines_list.shape[0]):
+        for j in range(lines_list.shape[2]):
+            rows.append(list(lines_list[i, :, j])+[snapshot_index[i], j])
+    df = pd.DataFrame(rows, columns=y_index+[snapshot, 'x'])
+    px.line(df, x='x', y=y_index, animation_frame=snapshot, range_y=[lines_list.min(), lines_list.max()], hover_name=hover, **kwargs).show()
+
+
+def animate_scatter(lines_list, snapshot_index = None, snapshot='snapshot', hover=None, yaxis='y', xaxis='x', color=None, color_name = 'color', **kwargs):
+    # Can plot an animated scatter plot
+    # lines_list has shape snapshot x 2 x line
+    if type(lines_list)==list:
+        lines_list = t.stack(lines_list, axis=0)
+    lines_list = utils.to_numpy(lines_list)
+    if snapshot_index is None:
+        snapshot_index = np.arange(lines_list.shape[0])
+    if hover is not None:
+        hover = [i for j in range(len(snapshot_index)) for i in hover]
+    if color is None:
+        color = np.ones(lines_list.shape[-1])
+    if type(color)==t.Tensor:
+        color = utils.to_numpy(color)
+    if len(color.shape)==1:
+        color = einops.repeat(color, 'x -> snapshot x', snapshot=lines_list.shape[0])
+    # print(lines_list.shape)
+    rows=[]
+    for i in range(lines_list.shape[0]):
+        for j in range(lines_list.shape[2]):
+            rows.append([lines_list[i, 0, j].item(), lines_list[i, 1, j].item(), snapshot_index[i], color[i, j]])
+    # print([lines_list[:, 0].min(), lines_list[:, 0].max()])
+    # print([lines_list[:, 1].min(), lines_list[:, 1].max()])
+    df = pd.DataFrame(rows, columns=[xaxis, yaxis, snapshot, color_name])
+    px.scatter(df, x=xaxis, y=yaxis, animation_frame=snapshot, range_x=[lines_list[:, 0].min(), lines_list[:, 0].max()], range_y=[lines_list[:, 1].min(), lines_list[:, 1].max()], hover_name=hover, color=color_name, **kwargs).show()
+
+
+
+
+
+
+
+def fft1d(tensor):
+    # Converts a tensor with dimension p into the Fourier basis
+    return tensor @ fourier_basis.T
+
+def fourier_2d_basis_term(x_index, y_index):
+    # Returns the 2D Fourier basis term corresponding to the outer product of 
+    # the x_index th component in the x direction and y_index th component in the 
+    # y direction
+    # Returns a 1D vector of length p^2
+    return (fourier_basis[x_index][:, None] * fourier_basis[y_index][None, :]).flatten()
+
+def fft2d(tensor: t.Tensor) -> t.Tensor:
+    '''
+    Retuns the components of `tensor` in the 2D Fourier basis.
+
+    Asumes that the input has shape `(p, p, ...)`.
+    Output has the same shape as the input.
+    '''
+    # fourier_basis[i] is the i-th basis vector, which we want to multiply along
+    return einops.einsum(
+        tensor, fourier_basis, fourier_basis,
+        "px py ..., i px, j py -> i j ..."
+    )
+
+def analyse_fourier_2d(tensor, top_k=10):
+    # Processes a (p,p) or (p*p) tensor in the 2D Fourier Basis, showing the 
+    # top_k terms and how large a fraction of the variance they explain
+    values, indices = tensor.flatten().pow(2).sort(descending=True)
+    rows = []
+    total = values.sum().item()
+    for i in range(top_k):
+        rows.append([tensor.flatten()[indices[i]].item(),
+                     values[i].item()/total, 
+                     values[:i+1].sum().item()/total, 
+                     fourier_basis_names[indices[i].item()//p], 
+                     fourier_basis_names[indices[i]%p]])
+    display(pd.DataFrame(rows, columns=['Coefficient', 'Frac explained', 'Cumulative frac explained', 'x', 'y']))
+
+def get_2d_fourier_component(tensor, x, y):
+    # Takes in a batch x ... tensor and projects it onto the 2D Fourier Component 
+    # (x, y)
+    vec = fourier_2d_basis_term(x, y).flatten()
+    return vec[:, None] @ (vec[None, :] @ tensor)
+
+def get_component_cos_xpy(tensor, freq, collapse_dim=False):
+    # Gets the component corresponding to cos(freq*(x+y)) in the 2D Fourier basis
+    # This is equivalent to the matrix cos((x+y)*freq*2pi/p)
+    cosx_cosy_direction = fourier_2d_basis_term(2*freq-1, 2*freq-1).flatten()
+    sinx_siny_direction = fourier_2d_basis_term(2*freq, 2*freq).flatten()
+    # Divide by sqrt(2) to ensure it remains normalised
+    cos_xpy_direction = (cosx_cosy_direction - sinx_siny_direction)/np.sqrt(2)
+    # Collapse_dim says whether to project back into R^(p*p) space or not
+    if collapse_dim:
+        return (cos_xpy_direction @ tensor)
     else:
-        if split == 'train':
-            x = train_data[batch_idx*batch_size:(batch_idx+1)*batch_size]
-            y = train_labels[batch_idx*batch_size:(batch_idx+1)*batch_size]
+        return cos_xpy_direction[:, None] @ (cos_xpy_direction[None, :] @ tensor)
+
+def get_component_sin_xpy(tensor, freq, collapse_dim=False):
+    # Gets the component corresponding to sin((x+y)*freq*2pi/p) in the 2D Fourier basis
+    sinx_cosy_direction = fourier_2d_basis_term(2*freq, 2*freq-1).flatten()
+    cosx_siny_direction = fourier_2d_basis_term(2*freq-1, 2*freq).flatten()
+    sin_xpy_direction = (sinx_cosy_direction + cosx_siny_direction)/np.sqrt(2)
+    if collapse_dim:
+        return (sin_xpy_direction @ tensor)
+    else:
+        return sin_xpy_direction[:, None] @ (sin_xpy_direction[None, :] @ tensor)
+
+
+def arrange_by_2d_freqs(tensor):
+    '''
+    Takes a tensor of shape (p, p, ...) and returns a tensor of shape
+    (p//2 - 1, 3, 3, ...) representing the Fourier coefficients sorted by
+    frequency (each slice contains const, linear and quadratic terms).
+
+    In other words, if the first two dimensions of the original tensor
+    correspond to indexing by 2D Fourier frequencies as follows:
+
+        1           cos(w_1*x)            sin(w_1*x)           ...
+        cos(w_1*y)  cos(w_1*x)cos(w_1*y)  sin(w_1*x)cos(w_1*y) ...
+        sin(w_1*y)  cos(w_1*x)sin(w_1*y)  sin(w_1*x)sin(w_1*y) ...
+        cos(w_2*y)  cos(w_1*x)cos(w_2*y)  sin(w_1*x)cos(w_2*y) ...
+        ...
+
+    Then the (k-1)-th slice of the new tensor are the terms corresponding to
+    the following 2D Fourier frequencies:
+
+        1           cos(w_k*x)            sin(w_k*x)           ...
+        cos(w_k*y)  cos(w_k*x)cos(w_k*y)  sin(w_k*x)cos(w_k*y) ...
+        sin(w_k*y)  cos(w_k*x)sin(w_k*y)  sin(w_k*x)sin(w_k*y) ...
+
+    for k = 1, 2, ..., p//2.
+
+    Note we omit the constant term, i.e. the 0th slice has frequency k=1.
+    '''
+    idx_2d_y_all = []
+    idx_2d_x_all = []
+    for freq in range(1, p//2):
+        idx_1d = [0, 2*freq-1, 2*freq]
+        idx_2d_x_all.append([idx_1d for _ in range(3)])
+        idx_2d_y_all.append([[i]*3 for i in idx_1d])
+    return tensor[idx_2d_y_all, idx_2d_x_all]
+
+
+# Note the use of `einops.reduce` in the solution, rather than just using e.g.
+# `fourier_neuron_acts.pow(2).sum((0, 1)). Like most of the situations where
+# `einops` is helpful, this has the advantage of making your code more explicit,
+# readable, and reduces the chance of mistakes.
+
+def fft1d_given_dim(tensor: t.Tensor, dim: int) -> t.Tensor:
+    '''
+    Performs 1D FFT along the given dimension (not necessarily the last one).
+    '''
+    return fft1d(tensor.transpose(dim, -1)).transpose(dim, -1)
+
+def find_neuron_freqs(
+    fourier_neuron_acts):
+    '''
+    Returns the tensors `neuron_freqs` and `neuron_frac_explained`,
+    containing the frequencies that explain the most variance of each
+    neuron and the fraction of variance explained, respectively.
+    '''
+    fourier_neuron_acts_by_freq = arrange_by_2d_freqs(fourier_neuron_acts)
+    assert fourier_neuron_acts_by_freq.shape == (p//2-1, 3, 3, d_mlp)
+
+    # SOLUTION
+    # Sum squares of all frequency coeffs, for each neuron
+    square_of_all_terms = einops.reduce(
+        fourier_neuron_acts.pow(2),
+        "x_coeff y_coeff neuron -> neuron",
+        "sum"
+    )
+
+    # Sum squares just corresponding to const+linear+quadratic terms,
+    # for each frequency, for each neuron
+    square_of_each_freq = einops.reduce(
+        fourier_neuron_acts_by_freq.pow(2),
+        "freq x_coeff y_coeff neuron -> freq neuron",
+        "sum"
+    )
+
+    # Find the freq explaining most variance for each neuron
+    # (and the fraction of variance explained)
+    neuron_variance_explained, neuron_freqs = square_of_each_freq.max(0)
+    neuron_frac_explained = neuron_variance_explained / square_of_all_terms
+
+    # The actual frequencies count up from k=1, not 0!
+    neuron_freqs += 1
+
+    return neuron_freqs, neuron_frac_explained
+
+
+def project_onto_direction(batch_vecs: t.Tensor, v: t.Tensor) -> t.Tensor:
+    '''
+    Returns the component of each vector in `batch_vecs` in the direction of `v`.
+
+    batch_vecs.shape = (n, ...)
+    v.shape = (n,)
+    '''
+    return v[:, None] @ (v @ batch_vecs)[None, ...]
+
+def project_onto_frequency(batch_vecs: t.Tensor, freq: int) -> t.Tensor:
+    '''
+    Returns the projection of each vector in `batch_vecs` onto the
+    2D Fourier basis directions corresponding to frequency `freq`.
+
+    batch_vecs.shape = (p**2, ...)
+    '''
+    assert batch_vecs.shape[0] == p**2
+    # SOLUTION
+
+    return sum([
+        project_onto_direction(
+            batch_vecs,
+            fourier_2d_basis_term(i, j).flatten(),
+        )
+        for i in [0, 2*freq-1, 2*freq] for j in [0, 2*freq-1, 2*freq]
+    ])
+
+def get_trig_sum_directions(k: int) -> Tuple[Float[Tensor, "p p"], Float[Tensor, "p p"]]:
+    '''
+    Given frequency k, returns the normalized vectors in the 2D Fourier basis
+    representing the directions:
+
+        cos(ω_k * (x + y))
+        sin(ω_k * (x + y))
+
+    respectively.
+    '''
+    # SOLUTION
+    cosx_cosy_direction = fourier_2d_basis_term(2*k-1, 2*k-1)
+    sinx_siny_direction = fourier_2d_basis_term(2*k, 2*k)
+    sinx_cosy_direction = fourier_2d_basis_term(2*k, 2*k-1)
+    cosx_siny_direction = fourier_2d_basis_term(2*k-1, 2*k)
+
+    cos_xplusy_direction = (cosx_cosy_direction - sinx_siny_direction) / np.sqrt(2)
+    sin_xplusy_direction = (sinx_cosy_direction + cosx_siny_direction) / np.sqrt(2)
+
+    return cos_xplusy_direction, sin_xplusy_direction
+
+
+
+def load_in_state_dict(model, state_dict):
+    '''
+    Helper function to load in state dict, and do appropriate weight transpositions etc.
+    '''
+    state_dict_new = model.state_dict()
+
+    # Transpose
+    for k, v in state_dict.items():
+        if "W_" in k:
+            if "W_U" in k or "W_pos" in k:
+                state_dict_new[k] = v
+            elif "W_O" in k:
+                state_dict_new[k] = einops.rearrange(v, "d_model (n_heads d_head) -> n_heads d_head d_model", d_head=model.cfg.d_head)
+            else:
+                state_dict_new[k] = v.transpose(-1, -2)
+        elif "b_" in k:
+            state_dict_new[k] = v
+
+    # Make sure biases are zero
+    for k, v in state_dict_new.items():
+        if "b_" in k and "mlp" not in k:
+            state_dict_new[k] = t.zeros_like(v)
+    state_dict_new["blocks.0.attn.IGNORE"] = t.full_like(state_dict_new["blocks.0.attn.IGNORE"], -1e10)
+    
+    model.load_state_dict(state_dict_new)
+    return model
+
+def modified_load_in_state_dict(model, state_dict):
+    """
+    Loads in state dict, modified for nanogpt
+    """
+    state_dict_new = model.state_dict()
+    for k, v in state_dict.items():
+        if 'wte' in k:
+            state_dict_new["embed.W_E"] = v
+        elif 'wpe' in k:
+            state_dict_new["pos_embed.W_pos"] = v
+        elif "lm_head" in k:
+            state_dict_new["unembed.W_U"] = v.transpose(-1, -2)
+        elif "mlp.c_proj" in k:
+            state_dict_new["blocks.0.mlp.W_out"] = v.transpose(-1, -2)
+        elif "mlp.c_fc" in k:
+            state_dict_new["blocks.0.mlp.W_in"] = v.transpose(-1, -2)
+        elif "attn.c_proj" in k:
+            state_dict_new["blocks.0.attn.W_O"] = einops.rearrange(v, "d_model (n_heads d_head) -> n_heads d_head d_model", d_head=model.cfg.d_head)
+        elif "attn.c_attn" in k:
+            Q, K, V  = v.chunk(3, dim=0)
+            Q = Q.view(4, 32, 128).transpose(-1, -2)
+            K = K.view(4, 32, 128).transpose(-1, -2)
+            V = V.view(4, 32, 128).transpose(-1, -2)
+            state_dict_new["blocks.0.attn.W_Q"] = Q
+            state_dict_new["blocks.0.attn.W_K"] = K
+            state_dict_new["blocks.0.attn.W_V"] = V
+        """
+        elif "ln_f" in k:
+            state_dict_new["ln_final.w"] = v
+        elif "ln_1" in k:
+            state_dict_new["blocks.0.ln1.w"] = v
+        elif "ln_2" in k:
+            state_dict_new["blocks.0.ln2.w"] = v
+        """
+        
+    # Make sure biases are zero
+    for k, v in state_dict_new.items():
+        if "b_" in k or ".b" in k:
+            state_dict_new[k] = t.zeros_like(v)
+    state_dict_new["blocks.0.attn.IGNORE"] = t.full_like(state_dict_new["blocks.0.attn.IGNORE"], -1e10)
+    
+    
+    model.load_state_dict(state_dict_new)
+    return model
+
+
+# # Hate that I needed to do this lol
+# def fix_order_of_attn_calc(model: HookedTransformer) -> HookedTransformer:
+
+#     model.reset_hooks(including_permanent=True)
+
+#     def cache_z(
+#             z: TT["batch", "seq", "head", "d_head"], 
+#             hook: HookPoint
+#     ) -> None:
+#         hook.ctx["z"] = z
+
+#     def calc_correct_attn_out(
+#         attn_out: TT["batch", "seq", "d_model"],
+#         hook: HookPoint,
+#     ) -> None:
+#         attn_out = einops.einsum(
+#             model.hook_dict["blocks.0.attn.hook_z"].ctx["z"], 
+#             model.W_O[0],
+#             "batch seq head d_head, head d_head d_model -> batch seq d_model"
+#         )
+#         del model.hook_dict["blocks.0.attn.hook_z"].ctx["z"]
+#         return attn_out
+
+#     # Add these hooks as permanent hooks (i.e. they aren't removed after functions like run_with_hooks)
+#     model.hook_dict["blocks.0.attn.hook_z"].add_perma_hook(cache_z)
+#     model.hook_dict["blocks.0.hook_attn_out"].add_perma_hook(calc_correct_attn_out)
+
+#     return model
+
+
+
+
+def gen_train_test(frac_train, num, seed=0):
+    # Generate train and test split
+    pairs = [(i, j, num) for i in range(num) for j in range(num)]
+    random.seed(seed)
+    random.shuffle(pairs)
+    div = int(frac_train*len(pairs))
+    return pairs[:div], pairs[div:]
+
+train, test = gen_train_test(frac_train, p, seed)
+# print(len(train), len(test))
+
+
+# Creates an array of Boolean indices according to whether each data point is in 
+# train or test
+# Used to index into the big batch of all possible data
+is_train = []
+is_test = []
+for x in range(p):
+    for y in range(p):
+        if (x, y, 113) in train:
+            is_train.append(True)
+            is_test.append(False)
         else:
-            x = val_data[batch_idx*batch_size:(batch_idx+1)*batch_size]
-            y = val_labels[batch_idx*batch_size:(batch_idx+1)*batch_size]
-    x = x.contiguous()
-    y = y.contiguous()
-    x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    return x, y
-
-# %%
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
-# training loop
-X, Y = get_batch('train', 0) # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model # unwrap DDP container if needed
-running_mfu = -1.0
-run_data = {
-    'train_loss': [],
-    'val_loss': [],
-    'train_accuracy': [],
-    'val_accuracy': [],
-    'embedding': [],
-}
-while True:
-    batch_index = 0
-    # determine and set the learning rate for this iteration
-    #lr = get_lr(iter_num) if decay_lr else learning_rate
-    lr = learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = get_loss()
-        split_losses = get_loss_both()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train accuracy {losses['train_accuracy']:.4f}, val accuracy {losses['val_accuracy']:.4f}")
-        print(f"add loss {split_losses['add']:.4f}, add acc {split_losses['add_acc']:.4f}, sub loss {split_losses['sub']:.4f}, sub acc {split_losses['sub_acc']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "train/accuracy": losses['train_accuracy'],
-                "val/accuracy": losses["val_accuracy"],
-                "total_losses/add": split_losses['add'],
-                "total_losses/sub": split_losses['sub'],
-                "total_accs/add": split_losses['add_acc'],
-                "total_accs/sub": split_losses['sub_acc'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            run_data["train_loss"].append(losses['train'].item())
-            run_data["val_loss"].append(losses['val'].item())
-            run_data["train_accuracy"].append(losses['train_accuracy'].item())
-            run_data["val_accuracy"].append(losses['val_accuracy'].item())
-            run_data["embedding"].append(model.transformer.wte)
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                    'run_data': run_data,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, title))
-    if iter_num == 0 and eval_only:
-        break
-
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        with ctx:
-            logits, loss, accuracy = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        X, Y = get_batch('train', batch_index)
-        batch_index += 1
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
-
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == -1 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
-
-    # termination conditions
-    if iter_num > max_iters:
-        break
+            is_train.append(False)
+            is_test.append(True)
+is_train = np.array(is_train)
+is_test = np.array(is_test)
