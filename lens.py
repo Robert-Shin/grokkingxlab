@@ -37,7 +37,7 @@ cfg = HookedTransformerConfig(
 hooked_model = HookedTransformer(cfg)
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'my_runs' # ignored if init_from is not 'resume'
-title = "+-113_0_2e-4.pt"
+title = "+113_0_2e-4-fixed.pt"
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 seed_offset = 0
 seed = 1337 + seed_offset
@@ -79,7 +79,7 @@ full_run_data = checkpoint['run_data']
 train_loss = full_run_data['train_loss']
 val_loss = full_run_data['val_loss']
 
-epochs = list(range(0, len(train_loss)*25, 100))
+epochs = list(range(0, len(train_loss)*100, 100))
 
 # Create the plot
 fig = go.Figure()
@@ -113,6 +113,7 @@ W_pos = hooked_model.W_pos
 W_E = hooked_model.W_E[:-1]
 final_pos_resid_initial = hooked_model.W_E[-1] + W_pos[2]
 W_U = hooked_model.W_U[:, :-1]
+W_ln = state_dict['transformer.ln_f.weight']
 
 print('W_O  ', tuple(W_O.shape))
 print('W_K  ', tuple(W_K.shape))
@@ -123,24 +124,25 @@ print('W_out', tuple(W_out.shape))
 print('W_pos', tuple(W_pos.shape))
 print('W_E  ', tuple(W_E.shape))
 print('W_U  ', tuple(W_U.shape))
-
+print('W_ln ', tuple(W_ln.shape))
 # %%
 def fn(a, b):
     return (a + b) % p
 def subfn(a, b):
     return (a - b) % p
 all_data = t.tensor([(i, j, p) for i in range(p) for j in range(p)]).to(device)
-sub_data = t.tensor([(i, j, 0) for i in range(p) for j in range(p)]).to(device)
+sub_data = t.tensor([(i, j, p+1) for i in range(p) for j in range(p)]).to(device)
 labels = t.tensor([fn(i, j) for i, j, _ in all_data]).to(device)
 sub_labels = t.tensor([subfn(i, j) for i, j, _ in sub_data]).to(device)
 
 #all_data = t.cat((all_data, sub_data)).to(device)
 #labels = t.cat((labels, sub_labels)).to(device)
 
-original_logits, cache = hooked_model.run_with_cache(sub_data)
+original_logits, cache = hooked_model.run_with_cache(all_data)
 # Final position only, also remove the logits for `=`
 original_logits = original_logits[:, -1, :-1]
-original_loss = cross_entropy_high_precision(original_logits, sub_labels)
+
+original_loss = cross_entropy_high_precision(original_logits, labels)
 with t.no_grad():
     logits, original_loss, accuracy = model(all_data, labels)
 
@@ -150,7 +152,7 @@ attn_mat = cache['pattern', 0][:, :, 2]
 neuron_acts_post = cache['post', 0][:, -1]
 neuron_acts_pre = cache['pre', 0][:, -1]
 
-W_logit = W_out @ W_U
+W_logit = (W_out * W_ln) @ W_U
 
 W_OV = W_V @ W_O
 W_neur = W_E @ W_OV @ W_in
@@ -255,12 +257,32 @@ lines(
     hover=fourier_basis_names
 )
 # %%
+
 line(
     (fourier_basis @ W_E).pow(2).sum(1),
     hover=fourier_basis_names,
     title='Norm of embedding of each Fourier Component',
     xaxis='Fourier Component',
     yaxis='Norm'
+)
+# %%
+def prepare_lines_list(run_data, fourier_basis):
+    lines_list = []
+    for step in range(len(run_data['embedding'])):
+        W_E = run_data['embedding'][step][:-1]
+        norm_of_embedding = (fourier_basis @ W_E).pow(2).sum(1)
+        lines_list.append(norm_of_embedding)
+    return lines_list
+
+lines_list = prepare_lines_list(full_run_data, fourier_basis)
+animate_lines(
+    lines_list,
+    snapshot_index=np.arange(len(lines_list)),
+    snapshot='Time Step',
+    hover=fourier_basis_names,
+    xaxis='Fourier Component',
+    yaxis='Norm',
+    title='Evolution of Embedding Norm Over Time'
 )
 # %%
 W_neur_fourier = fft1d_given_dim(W_neur, dim=1)
@@ -311,31 +333,51 @@ key_freqs_plus = t.concatenate([key_freqs, -key_freqs.new_ones((1,))])
 
 for i, k in enumerate(key_freqs_plus):
     print(f'Cluster {i}: freq k={k}, {(neuron_freqs==k).sum()} neurons')
-
 # %%
-mask = torch.zeros(512, device=device, dtype=torch.int)
+print(neuron_freqs)
+# %%
+logits_in_freqs = []
+
 for freq in key_freqs:
-    new_mask = (neuron_freqs == freq).int()
-    mask = mask | new_mask
-with t.no_grad():
-    model.transformer.h[0].mlp.set_ablation_mask(mask)
-    logits, ablated_loss, accuracy = model(all_data, labels)
-    model.transformer.h[0].mlp.reset_ablation_mask()
-print('Loss with neuron activations ONLY in key freq\n{:.6e}\n'.format(ablated_loss))
+    filtered_neuron_acts = neuron_acts_post[:, neuron_freqs==freq]
+    filtered_neuron_acts_in_freq = project_onto_frequency(filtered_neuron_acts, freq)
+    logits_in_freq = filtered_neuron_acts_in_freq @ W_logit[neuron_freqs==freq]
+    logits_in_freqs.append(logits_in_freq)
+
+print('Loss with neuron activations ONLY in key freq (inclusing always firing cluster)\n{:.6e}\n'.format( 
+    test_logits(
+        sum(logits_in_freqs), 
+        bias_correction=True, 
+        original_logits=original_logits
+    )
+))
+print('Loss with neuron activations ONLY in key freq (exclusing always firing cluster)\n{:.6e}\n'.format( 
+    test_logits(
+        sum(logits_in_freqs[:-1]), 
+        bias_correction=True, 
+        original_logits=original_logits
+    )
+))
+print('Loss with zeroed logits\n{:.6e}\n'.format( 
+    test_logits(
+        t.zeros(12769,113, device='cuda'), 
+        bias_correction=True, 
+        original_logits=original_logits
+    )
+))
 print('Original loss\n{:.6e}'.format(original_loss))
 
 # %%
 print('Loss with neuron activations excluding none:     {:.9f}'.format(original_loss.item()))
-for c, freq in enumerate(key_freqs):
-    mask = torch.ones(512, device=device, dtype=torch.int)
-    new_mask = (neuron_freqs != freq).int()
-    mask = mask & new_mask
-    with t.no_grad():
-        model.transformer.h[0].mlp.set_ablation_mask(mask)
-        l, ablated_loss, _ = model(all_data, labels)
-        model.transformer.h[0].mlp.reset_ablation_mask()
-    print('Loss with neuron activations excluding freq={}:  {:.9f}'.format(freq, ablated_loss))
-
+for c, freq in enumerate(key_freqs_plus):
+    print('Loss with neuron activations excluding freq={}:  {:.9f}'.format(
+        freq, 
+        test_logits(
+            sum(logits_in_freqs) - logits_in_freqs[c], 
+            bias_correction=True, 
+            original_logits=original_logits
+        )
+    ))
 # %%
 US = W_logit @ fourier_basis.T
 
@@ -346,5 +388,19 @@ imshow_div(
     title='W_logit in the Fourier Basis',
     height=800,
     width=600
+)
+# %%
+imshow_fourier(
+    einops.reduce(neuron_acts_centered_fourier.pow(2), 'y x neuron -> y x', 'mean'), 
+    title='Norm of Fourier Components of Neuron Acts'
+)
+
+# Rearrange logits, so the first two dims represent (x, y) in modular arithmetic equation
+original_logits_sq = einops.rearrange(original_logits, "(x y) z -> x y z", x=p)
+original_logits_fourier = fft2d(original_logits_sq)
+
+imshow_fourier(
+    einops.reduce(original_logits_fourier.pow(2), 'y x z -> y x', 'mean'), 
+    title='Norm of Fourier Components of Logits'
 )
 # %%
