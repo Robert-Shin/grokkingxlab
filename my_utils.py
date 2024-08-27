@@ -244,7 +244,13 @@ def animate_lines(lines_list, snapshot_index = None, snapshot='snapshot', hover=
         for j in range(lines_list.shape[1]):
             rows.append([lines_list[i][j], snapshot_index[i], j])
     df = pd.DataFrame(rows, columns=[yaxis, snapshot, xaxis])
-    px.line(df, x=xaxis, y=yaxis, title=title, animation_frame=snapshot, range_y=[lines_list.min(), lines_list.max()], hover_name=hover,**kwargs).show()
+    fig = px.line(df, x=xaxis, y=yaxis, title=title, animation_frame=snapshot, range_y=[lines_list.min(), lines_list.max()], hover_name=hover,**kwargs)
+    fig.update_layout(
+        transition={'duration': 0},
+        xaxis_title=xaxis,
+        yaxis_title=yaxis,
+    )
+    fig.show()
 
 
 def imshow_fourier(tensor, title='', animation_name='snapshot', facet_labels=[], animation_labels=[], **kwargs):
