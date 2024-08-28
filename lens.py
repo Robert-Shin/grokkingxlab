@@ -10,6 +10,7 @@ import torch
 import tiktoken
 import plotly.express as px
 import plotly.graph_objects as go
+import imageio
 from typing import List, Tuple, Union, Optional
 from fancy_einsum import einsum
 import einops
@@ -37,7 +38,7 @@ cfg = HookedTransformerConfig(
 hooked_model = HookedTransformer(cfg)
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'my_runs' # ignored if init_from is not 'resume'
-title = "+113_0_2e-4-fixed.pt"
+title = "+113_2_2e-4-retry.pt"
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 seed_offset = 0
 seed = 1337 + seed_offset
@@ -142,7 +143,6 @@ original_logits, cache = hooked_model.run_with_cache(all_data)
 # Final position only, also remove the logits for `=`
 original_logits = original_logits[:, -1, :-1]
 
-original_loss = cross_entropy_high_precision(original_logits, labels)
 with t.no_grad():
     logits, original_loss, accuracy = model(all_data, labels)
 
@@ -284,6 +284,7 @@ animate_lines(
     yaxis='Norm',
     title='Evolution of Embedding Norm Over Time'
 )
+
 # %%
 W_neur_fourier = fft1d_given_dim(W_neur, dim=1)
 
@@ -404,3 +405,120 @@ imshow_fourier(
     title='Norm of Fourier Components of Logits'
 )
 # %%
+# graphing a bunch of runs
+titles = ["+113_0_2e-4-fixed.pt", "+113_1_2e-4-fixed.pt", "+113_2_2e-4-fixed.pt", "+113_4_2e-4.pt", "+113_5_2e-4.pt"]
+checkpoints = []
+for title in titles:
+    ckpt_path = os.path.join(out_dir, title)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoints.append(checkpoint)
+train_losses = []
+val_losses = []
+epochs_list = []
+
+for checkpoint in checkpoints:
+    full_run_data = checkpoint['run_data']
+    train_loss = full_run_data['train_loss']
+    val_loss = full_run_data['val_loss']
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    epochs_list.append(list(range(0, len(train_loss)*100, 100)))
+
+# Calculate the average train and validation losses
+avg_train_loss = np.mean(train_losses, axis=0)
+avg_val_loss = np.mean(val_losses, axis=0)
+
+# Make sure all epochs lists are the same length
+epochs = epochs_list[0]
+fig_train = go.Figure()
+
+# Add traces for each run
+for i, train_loss in enumerate(train_losses):
+    fig_train.add_trace(go.Scatter(x=epochs, y=train_loss, mode='lines', name=f'Train Loss Run {i+1}', opacity=0.5))
+
+# Add the average trace with full opacity
+fig_train.add_trace(go.Scatter(x=epochs, y=avg_train_loss, mode='lines', name='Average Train Loss', line=dict(color='red', width=2)))
+
+# Update layout for training loss plot
+fig_train.update_layout(
+    title='Training Loss for Multiple Runs',
+    xaxis_title='Epoch',
+    yaxis_title='Loss',
+    template='plotly_white'
+)
+
+# Show the training loss plot
+fig_train.show()
+fig_val = go.Figure()
+
+# Add traces for each run
+for i, val_loss in enumerate(val_losses):
+    fig_val.add_trace(go.Scatter(x=epochs, y=val_loss, mode='lines', name=f'Validation Loss Run {i+1}', opacity=0.5))
+
+# Add the average trace with full opacity
+fig_val.add_trace(go.Scatter(x=epochs, y=avg_val_loss, mode='lines', name='Average Validation Loss', line=dict(color='red', width=2)))
+
+# Update layout for validation loss plot
+fig_val.update_layout(
+    title='Validation Loss for Multiple Runs',
+    xaxis_title='Epoch',
+    yaxis_title='Loss',
+    template='plotly_white'
+)
+
+# Show the validation loss plot
+fig_val.show()
+# %% 
+# Fourier embedding GIF Creation
+# %%
+image_dir = 'embedding_images'
+os.makedirs(image_dir, exist_ok=True)
+
+def line(x, y=None, hover=None, xaxis='', yaxis='', **kwargs):
+    if type(y) == t.Tensor:
+        y = utils.to_numpy(y.flatten())
+    if type(x) == t.Tensor:
+        x = utils.to_numpy(x.flatten())
+    fig = px.line(x, y=y, hover_name=hover, **kwargs)
+    fig.update_layout(xaxis_title=xaxis, yaxis_title=yaxis)
+    if x.ndim == 1:
+        fig.update_layout(showlegend=False)
+    return fig
+
+def save_plot_as_image(step, output_dir):
+    W_E = full_run_data['embedding'][step]
+    norm_of_embedding = (fourier_basis @ W_E[:-1]).pow(2).sum(1)
+    fig = line(
+        norm_of_embedding,
+        hover=fourier_basis_names,
+        title=f'Norm of embedding of each Fourier Component at step {step}',
+        xaxis='Fourier Component',
+        yaxis='Norm'
+    )
+    image_path = os.path.join(output_dir, f'frame_{step}.png')
+    fig.write_image(image_path)
+    return image_path
+
+# Save all frames as images
+image_paths = []
+for step in range(len(full_run_data['embedding'])):
+    image_path = save_plot_as_image(step, image_dir)
+    image_paths.append(image_path)
+
+gif_path = os.path.join(image_dir, 'embedding_evolution.gif')
+
+# Assuming image_paths is a list of image file paths
+num_images = len(image_paths)
+
+# Create the GIF
+with imageio.get_writer(gif_path, mode='I') as writer:
+    for i, image_path in enumerate(image_paths):
+        image = imageio.imread(image_path)
+        
+        # Set the duration based on the image index
+        if i < num_images // 4:
+            duration = 1.0  # Slower duration for the first quarter (1 second per frame)
+        else:
+            duration = 0.2  # Faster duration for the remaining frames (0.2 seconds per frame)
+        
+        writer.append_data(image, {'duration': duration})
